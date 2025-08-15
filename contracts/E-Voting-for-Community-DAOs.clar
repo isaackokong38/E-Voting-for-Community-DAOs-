@@ -261,3 +261,70 @@
         (ok (>= total-votes (get required-quorum category-config)))
     )
 )
+
+(define-public (finalize-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-ACTIVE-PROPOSAL))
+            (current-status (get status proposal))
+            (voting-ended (>= stacks-block-height (get end-block proposal)))
+            (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+            (yes-votes (get yes-votes proposal))
+            (no-votes (get no-votes proposal))
+        )
+        (asserts! voting-ended ERR-VOTE-CLOSED)
+        (asserts! (or (is-eq current-status "active") 
+                     (is-eq current-status CATEGORY-GOVERNANCE)
+                     (is-eq current-status CATEGORY-TREASURY)
+                     (is-eq current-status CATEGORY-TECHNICAL)
+                     (is-eq current-status CATEGORY-GENERAL)) ERR-INVALID-VOTE)
+        (let
+            (
+                (quorum-met (if (or (is-eq current-status CATEGORY-GOVERNANCE)
+                                   (is-eq current-status CATEGORY-TREASURY)
+                                   (is-eq current-status CATEGORY-TECHNICAL)
+                                   (is-eq current-status CATEGORY-GENERAL))
+                               (let ((category-config (unwrap! (map-get? CategoryConfig current-status) ERR-INVALID-VOTE)))
+                                    (>= total-votes (get required-quorum category-config)))
+                               (> total-votes u0)))
+                (final-status (if quorum-met
+                                 (if (> yes-votes no-votes) "passed" "rejected")
+                                 "failed"))
+            )
+            (ok (map-set Proposals proposal-id (merge proposal { status: final-status })))
+        )
+    )
+)
+
+(define-read-only (get-proposal-status (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? Proposals proposal-id) (err u404)))
+            (voting-ended (>= stacks-block-height (get end-block proposal)))
+            (current-status (get status proposal))
+        )
+        (if voting-ended
+            (if (or (is-eq current-status "passed")
+                   (is-eq current-status "rejected") 
+                   (is-eq current-status "failed"))
+                (ok current-status)
+                (ok "expired"))
+            (ok current-status))
+    )
+)
+
+(define-read-only (is-proposal-active (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? Proposals proposal-id) (err u404)))
+            (voting-ended (>= stacks-block-height (get end-block proposal)))
+            (current-status (get status proposal))
+        )
+        (ok (and (not voting-ended)
+                (or (is-eq current-status "active")
+                   (is-eq current-status CATEGORY-GOVERNANCE)
+                   (is-eq current-status CATEGORY-TREASURY)
+                   (is-eq current-status CATEGORY-TECHNICAL)
+                   (is-eq current-status CATEGORY-GENERAL))))
+    )
+)
