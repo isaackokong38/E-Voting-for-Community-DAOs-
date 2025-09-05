@@ -65,6 +65,7 @@
         (asserts! (> blocks u0) ERR-INVALID-VOTE)
         (var-set total-proposals proposal-id)
         (var-set current-proposal-id proposal-id)
+        (update-member-reputation-proposal tx-sender)
         (ok (map-set Proposals proposal-id {
             title: title,
             description: description,
@@ -229,6 +230,7 @@
         (asserts! (<= blocks (get max-voting-period category-config)) ERR-INVALID-VOTE)
         (var-set total-proposals proposal-id)
         (var-set current-proposal-id proposal-id)
+        (update-member-reputation-proposal tx-sender)
         (map-set ProposalsByCategory { category: category, proposal-id: proposal-id } true)
         (ok (map-set Proposals proposal-id {
             title: title,
@@ -327,4 +329,125 @@
                    (is-eq current-status CATEGORY-TECHNICAL)
                    (is-eq current-status CATEGORY-GENERAL))))
     )
+)
+
+(define-map MemberReputation
+    principal
+    {
+        votes-cast: uint,
+        proposals-created: uint,
+        participation-score: uint,
+        reputation-level: uint
+    }
+)
+
+(define-constant REPUTATION-MULTIPLIER-BASE u1)
+(define-constant REPUTATION-MULTIPLIER-BRONZE u2)
+(define-constant REPUTATION-MULTIPLIER-SILVER u3)
+(define-constant REPUTATION-MULTIPLIER-GOLD u5)
+
+(define-constant BRONZE-THRESHOLD u10)
+(define-constant SILVER-THRESHOLD u25)
+(define-constant GOLD-THRESHOLD u50)
+
+(define-private (calculate-reputation-level (score uint))
+    (if (>= score GOLD-THRESHOLD)
+        u4
+        (if (>= score SILVER-THRESHOLD)
+            u3
+            (if (>= score BRONZE-THRESHOLD)
+                u2
+                u1)))
+)
+
+(define-private (get-reputation-multiplier (level uint))
+    (if (is-eq level u4)
+        REPUTATION-MULTIPLIER-GOLD
+        (if (is-eq level u3)
+            REPUTATION-MULTIPLIER-SILVER
+            (if (is-eq level u2)
+                REPUTATION-MULTIPLIER-BRONZE
+                REPUTATION-MULTIPLIER-BASE)))
+)
+
+(define-private (update-member-reputation-vote (member principal))
+    (let
+        (
+            (current-rep (default-to { votes-cast: u0, proposals-created: u0, participation-score: u0, reputation-level: u1 }
+                                   (map-get? MemberReputation member)))
+            (new-votes (+ (get votes-cast current-rep) u1))
+            (new-score (+ (get participation-score current-rep) u1))
+            (new-level (calculate-reputation-level new-score))
+        )
+        (map-set MemberReputation member {
+            votes-cast: new-votes,
+            proposals-created: (get proposals-created current-rep),
+            participation-score: new-score,
+            reputation-level: new-level
+        })
+    )
+)
+
+(define-private (update-member-reputation-proposal (member principal))
+    (let
+        (
+            (current-rep (default-to { votes-cast: u0, proposals-created: u0, participation-score: u0, reputation-level: u1 }
+                                   (map-get? MemberReputation member)))
+            (new-proposals (+ (get proposals-created current-rep) u1))
+            (new-score (+ (get participation-score current-rep) u2))
+            (new-level (calculate-reputation-level new-score))
+        )
+        (map-set MemberReputation member {
+            votes-cast: (get votes-cast current-rep),
+            proposals-created: new-proposals,
+            participation-score: new-score,
+            reputation-level: new-level
+        })
+    )
+)
+
+(define-public (vote-with-reputation (proposal-id uint) (vote-bool bool))
+    (let
+        (
+            (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-ACTIVE-PROPOSAL))
+            (voter-key { proposal-id: proposal-id, voter: tx-sender })
+            (member-rep (default-to { votes-cast: u0, proposals-created: u0, participation-score: u0, reputation-level: u1 }
+                                  (map-get? MemberReputation tx-sender)))
+            (vote-weight (get-reputation-multiplier (get reputation-level member-rep)))
+        )
+        (asserts! (is-some (map-get? Members tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-some (map-get? Voters voter-key))) ERR-ALREADY-VOTED)
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTE-CLOSED)
+        (map-set Voters voter-key { vote: vote-bool })
+        (update-member-reputation-vote tx-sender)
+        (if vote-bool
+            (map-set Proposals proposal-id (merge proposal { yes-votes: (+ (get yes-votes proposal) vote-weight) }))
+            (map-set Proposals proposal-id (merge proposal { no-votes: (+ (get no-votes proposal) vote-weight) }))
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-member-reputation (member principal))
+    (map-get? MemberReputation member)
+)
+
+(define-read-only (get-voting-power (member principal))
+    (let
+        (
+            (member-rep (default-to { votes-cast: u0, proposals-created: u0, participation-score: u0, reputation-level: u1 }
+                                  (map-get? MemberReputation member)))
+        )
+        (get-reputation-multiplier (get reputation-level member-rep))
+    )
+)
+
+(define-read-only (get-reputation-level-name (level uint))
+    (if (is-eq level u4)
+        "Gold"
+        (if (is-eq level u3)
+            "Silver"
+            (if (is-eq level u2)
+                "Bronze"
+                "Base")))
 )
