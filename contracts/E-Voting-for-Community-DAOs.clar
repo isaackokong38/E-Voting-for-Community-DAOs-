@@ -3,6 +3,10 @@
 (define-constant ERR-ALREADY-VOTED (err u102))
 (define-constant ERR-INVALID-VOTE (err u103))
 (define-constant ERR-NO-ACTIVE-PROPOSAL (err u104))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u105))
+(define-constant ERR-DELEGATE-NOT-REGISTERED (err u106))
+(define-constant ERR-DELEGATION-EXISTS (err u107))
+(define-constant ERR-NO-DELEGATION (err u108))
 
 (define-data-var admin principal tx-sender)
 (define-data-var current-proposal-id uint u0)
@@ -30,6 +34,18 @@
 (define-map VoterRegistry
   { address: principal }
   { verified: bool }
+)
+
+;; Delegation mapping: delegator -> delegate for specific proposals
+(define-map ProposalDelegations
+  { delegator: principal, proposal-id: uint }
+  { delegate: principal, delegation-block: uint }
+)
+
+;; Track delegation power per delegate per proposal
+(define-map DelegationPower
+  { delegate: principal, proposal-id: uint }
+  { total-power: uint }
 )
 
 (define-public (initialize-contract)
@@ -95,3 +111,93 @@
       (map-set Proposals { proposal-id: proposal-id }
         (merge proposal { status: "completed" }))
       (ok true))))
+
+;; === DELEGATION FUNCTIONS ===
+
+;; Delegate voting power to another registered voter for a specific proposal
+(define-public (delegate-vote (proposal-id uint) (delegate principal))
+  (let ((proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id }) ERR-NO-ACTIVE-PROPOSAL)))
+    (begin
+      ;; Ensure delegator is registered voter
+      (asserts! (is-some (map-get? VoterRegistry { address: tx-sender })) ERR-NOT-AUTHORIZED)
+      ;; Ensure delegate is registered voter  
+      (asserts! (is-some (map-get? VoterRegistry { address: delegate })) ERR-DELEGATE-NOT-REGISTERED)
+      ;; Cannot delegate to self
+      (asserts! (not (is-eq tx-sender delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+      ;; Proposal must be active
+      (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTE-CLOSED)
+      ;; Cannot delegate if already voted directly
+      (asserts! (is-none (map-get? Voters { voter: tx-sender, proposal-id: proposal-id })) ERR-ALREADY-VOTED)
+      ;; Cannot delegate if delegation already exists
+      (asserts! (is-none (map-get? ProposalDelegations { delegator: tx-sender, proposal-id: proposal-id })) ERR-DELEGATION-EXISTS)
+      
+      ;; Store delegation
+      (map-set ProposalDelegations 
+        { delegator: tx-sender, proposal-id: proposal-id }
+        { delegate: delegate, delegation-block: stacks-block-height })
+      
+      ;; Update delegation power
+      (let ((current-power (default-to u0 (get total-power (map-get? DelegationPower { delegate: delegate, proposal-id: proposal-id })))))
+        (map-set DelegationPower
+          { delegate: delegate, proposal-id: proposal-id }
+          { total-power: (+ current-power u1) })
+        (ok true)))))
+
+;; Revoke delegation for a specific proposal
+(define-public (revoke-delegation (proposal-id uint))
+  (let ((delegation (unwrap! (map-get? ProposalDelegations { delegator: tx-sender, proposal-id: proposal-id }) ERR-NO-DELEGATION))
+        (proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id }) ERR-NO-ACTIVE-PROPOSAL)))
+    (begin
+      ;; Proposal must still be active
+      (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTE-CLOSED)
+      
+      ;; Remove delegation
+      (map-delete ProposalDelegations { delegator: tx-sender, proposal-id: proposal-id })
+      
+      ;; Update delegation power
+      (let ((delegate (get delegate delegation))
+            (current-power (default-to u0 (get total-power (map-get? DelegationPower { delegate: delegate, proposal-id: proposal-id })))))
+        (if (> current-power u0)
+          (map-set DelegationPower
+            { delegate: delegate, proposal-id: proposal-id }
+            { total-power: (- current-power u1) })
+          (map-delete DelegationPower { delegate: delegate, proposal-id: proposal-id })))
+      (ok true))))
+
+;; Cast vote as delegate (includes own vote + delegated votes)
+(define-public (cast-delegated-vote (proposal-id uint) (vote bool))
+  (let ((proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id }) ERR-NO-ACTIVE-PROPOSAL))
+        (delegation-power (default-to u0 (get total-power (map-get? DelegationPower { delegate: tx-sender, proposal-id: proposal-id })))))
+    (begin
+      ;; Ensure delegate is registered voter
+      (asserts! (is-some (map-get? VoterRegistry { address: tx-sender })) ERR-NOT-AUTHORIZED)
+      ;; Proposal must be active
+      (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTE-CLOSED)
+      ;; Cannot vote if already voted directly
+      (asserts! (is-none (map-get? Voters { voter: tx-sender, proposal-id: proposal-id })) ERR-ALREADY-VOTED)
+      
+      ;; Record that delegate has voted (prevents double voting)
+      (map-set Voters { voter: tx-sender, proposal-id: proposal-id } { voted: true })
+      
+      ;; Calculate total voting power (own vote + delegated votes)
+      (let ((total-votes (+ u1 delegation-power)))
+        (if vote
+          (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal { yes-votes: (+ (get yes-votes proposal) total-votes) }))
+          (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal { no-votes: (+ (get no-votes proposal) total-votes) })))
+        (ok total-votes)))))
+
+;; === READ-ONLY DELEGATION FUNCTIONS ===
+
+;; Get delegation info for a voter on specific proposal
+(define-read-only (get-delegation (delegator principal) (proposal-id uint))
+  (map-get? ProposalDelegations { delegator: delegator, proposal-id: proposal-id }))
+
+;; Get total delegation power for a delegate on specific proposal
+(define-read-only (get-delegation-power (delegate principal) (proposal-id uint))
+  (default-to u0 (get total-power (map-get? DelegationPower { delegate: delegate, proposal-id: proposal-id }))))
+
+;; Check if voter has delegated for a specific proposal
+(define-read-only (has-delegated (voter principal) (proposal-id uint))
+  (is-some (map-get? ProposalDelegations { delegator: voter, proposal-id: proposal-id })))
