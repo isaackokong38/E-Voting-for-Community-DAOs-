@@ -4,11 +4,12 @@
 (define-constant ERR-INVALID-VOTE (err u103))
 (define-constant ERR-NO-ACTIVE-PROPOSAL (err u104))
 (define-constant ERR-PROPOSAL-EXISTS (err u105))
-
+(define-constant ERR-PROPOSAL-FINALIZED (err u106))
+(define-constant ERR-PROPOSAL-NOT-ENDED (err u107))
 (define-data-var admin principal tx-sender)
 (define-data-var current-proposal-id uint u0)
 (define-data-var total-proposals uint u0)
-
+(define-data-var quorum-percentage uint u20)
 (define-map Proposals
     uint 
     {
@@ -75,6 +76,46 @@
             no-votes: u0,
             status: "active"
         }))
+    )
+)
+
+(define-public (set-quorum-percentage (percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (> percentage u0) (<= percentage u100)) ERR-INVALID-VOTE)
+        (var-set quorum-percentage percentage)
+        (ok percentage)
+    )
+)
+
+(define-public (finalize-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-ACTIVE-PROPOSAL))
+            (current-status (get status proposal))
+            (active-members (var-get total-active-members))
+            (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+            (required-quorum (var-get quorum-percentage))
+        )
+        (asserts! (is-some (map-get? Members tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq current-status "active") ERR-PROPOSAL-FINALIZED)
+        (asserts! (>= stacks-block-height (get end-block proposal)) ERR-PROPOSAL-NOT-ENDED)
+        (let
+            (
+                (quorum-met (if (and (> active-members u0) (> total-votes u0))
+                                (>= (* total-votes u100) (* active-members required-quorum))
+                                false))
+                (new-status (if quorum-met
+                                (if (> (get yes-votes proposal) (get no-votes proposal))
+                                    "passed"
+                                    (if (> (get no-votes proposal) (get yes-votes proposal))
+                                        "rejected"
+                                        "tie"))
+                                "quorum-failed"))
+            )
+            (map-set Proposals proposal-id (merge proposal { status: new-status }))
+            (ok { quorum-met: quorum-met, status: new-status })
+        )
     )
 )
 
